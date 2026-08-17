@@ -22,7 +22,7 @@ ROOMS = [1, 2]              # список нужных вариантов ко�
 BASE_URL = f"https://krisha.kz/arenda/kvartiry/{CITY}/"
 
 # Максимум страниц результатов, которые проверяем за один прогон
-MAX_PAGES = 3
+MAX_PAGES = 6
 
 # Файл, где хранятся ID уже увиденных объявлений
 SEEN_FILE = "seen_ids.json"

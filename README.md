@@ -45,7 +45,7 @@
 
 Открой `scraper.py`, в начале файла:
 
-```python
+```python   
 CITY = "petropavlovsk"
 PRICE_TO = 145000
 ROOMS = [1, 2]

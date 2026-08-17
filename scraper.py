@@ -2,8 +2,11 @@
 Парсер объявлений аренды квартир с krisha.kz
 Ищет новые объявления по заданным критериям и шлёт уведомления в Telegram.
 
-Критерии задаются через переменные окружения (см. workflow-файл) или
-можно поправить значения по умолчанию ниже.
+Важно: фильтры в URL Крыши (das[price][to] и т.д.) не всегда применяются
+надёжно при обычном GET-запросе (похоже, часть фильтрации у них работает
+через JS в браузере). Поэтому скрипт всегда дополнительно проверяет
+цену и количество комнат сам, уже после парсинга — это гарантирует, что
+в Telegram попадут только реально подходящие объявления.
 """
 
 import os
@@ -42,9 +45,9 @@ HEADERS = {
 
 
 def build_search_url(page: int) -> str:
-    params = [f"das[price][to]={PRICE_TO}"]
-    for r in ROOMS:
-        params.append(f"das[live.rooms][]={r}")
+    # Сортировка "сначала дешёвые" — так новые дешёвые объявления
+    # с большей вероятностью попадут в первые проверяемые страницы.
+    params = ["sort_by=price-asc"]
     if page > 1:
         params.append(f"page={page}")
     return BASE_URL + "?" + "&".join(params)
@@ -75,66 +78,89 @@ def fetch_page(url: str) -> str | None:
         return None
 
 
+def parse_price(text: str) -> int | None:
+    """Ищет в тексте цену вида '150 000 ₸' и возвращает её как число."""
+    m = re.search(r"([\d\s]{4,})\s*₸", text)
+    if not m:
+        return None
+    digits = re.sub(r"\D", "", m.group(1))
+    return int(digits) if digits else None
+
+
+def parse_rooms(text: str) -> int | None:
+    """Ищет в тексте количество комнат вида '2-комнатная'."""
+    m = re.search(r"(\d+)-комнатн", text)
+    if m:
+        return int(m.group(1))
+    return None
+
+
 def parse_listings(html: str) -> list[dict]:
     """
     Извлекает объявления из HTML страницы результатов.
-    Krisha рисует карточки в контейнерах с классом 'a-card'
-    и атрибутом data-id, содержащим ID объявления.
+
+    Подход устойчив к смене конкретных CSS-классов: сначала находим все
+    ссылки на /a/show/ID, а затем для каждой ищем ближайший родительский
+    блок, в тексте которого есть цена (символ ₸) — это и есть карточка
+    объявления. Из текста этого блока вытаскиваем цену и число комнат.
     """
     soup = BeautifulSoup(html, "html.parser")
     listings = []
+    seen_ids = set()
 
-    cards = soup.select("div.a-card[data-id]")
+    for a in soup.select('a[href*="/a/show/"]'):
+        href = a.get("href", "")
+        m = re.search(r"/a/show/(\d+)", href)
+        if not m:
+            continue
+        ad_id = m.group(1)
+        if ad_id in seen_ids:
+            continue
 
-    # Фолбэк на случай изменения вёрстки: ищем все ссылки на /a/show/ID
-    if not cards:
-        cards = []
-        seen_local = set()
-        for a in soup.select('a[href*="/a/show/"]'):
-            m = re.search(r"/a/show/(\d+)", a.get("href", ""))
-            if not m:
-                continue
-            ad_id = m.group(1)
-            if ad_id in seen_local:
-                continue
-            seen_local.add(ad_id)
-            # поднимаемся к родительскому блоку карточки
-            card = a.find_parent("div")
-            if card:
-                cards.append(card)
+        # Поднимаемся вверх по дереву, пока не найдём блок с ценой (₸)
+        card = a
+        card_text = ""
+        for _ in range(6):
+            card = card.find_parent("div")
+            if card is None:
+                break
+            card_text = card.get_text(" ", strip=True)
+            if "₸" in card_text:
+                break
 
-    for card in cards:
-        ad_id = card.get("data-id")
-        if not ad_id:
-            link = card.select_one('a[href*="/a/show/"]')
-            if not link:
-                continue
-            m = re.search(r"/a/show/(\d+)", link.get("href", ""))
-            if not m:
-                continue
-            ad_id = m.group(1)
+        if not card_text or "₸" not in card_text:
+            continue  # не нашли карточку с ценой — пропускаем
 
-        title_el = card.select_one("a.a-card__title")
-        price_el = card.select_one("div.a-card__price")
-        addr_el = card.select_one("div.a-card__subtitle")
-        link_el = card.select_one('a[href*="/a/show/"]')
+        seen_ids.add(ad_id)
 
-        title = title_el.get_text(strip=True) if title_el else "Квартира"
-        price = price_el.get_text(strip=True) if price_el else "?"
-        address = addr_el.get_text(strip=True) if addr_el else ""
-        href = link_el.get("href") if link_el else f"/a/show/{ad_id}"
-        if href and not href.startswith("http"):
-            href = "https://krisha.kz" + href
+        price = parse_price(card_text)
+        rooms = parse_rooms(card_text)
+
+        title = a.get_text(strip=True) or "Квартира"
+
+        full_url = href if href.startswith("http") else "https://krisha.kz" + href
 
         listings.append({
             "id": ad_id,
             "title": title,
             "price": price,
-            "address": address,
-            "url": href,
+            "rooms": rooms,
+            "url": full_url,
         })
 
     return listings
+
+
+def matches_criteria(item: dict) -> bool:
+    """Проверяет объявление по цене и комнатам. Без явной цены — пропускаем,
+    чтобы случайно не прислать что-то мимо критериев."""
+    if item["price"] is None:
+        return False
+    if item["price"] > PRICE_TO:
+        return False
+    if ROOMS and item["rooms"] is not None and item["rooms"] not in ROOMS:
+        return False
+    return True
 
 
 def send_telegram_message(text: str) -> None:
@@ -147,7 +173,6 @@ def send_telegram_message(text: str) -> None:
     payload = {
         "chat_id": CHAT_ID,
         "text": text,
-        "parse_mode": "HTML",
         "disable_web_page_preview": False,
     }
     try:
@@ -158,10 +183,11 @@ def send_telegram_message(text: str) -> None:
 
 
 def format_message(item: dict) -> str:
+    price_str = f"{item['price']:,} ₸".replace(",", " ") if item["price"] else "?"
+    rooms_str = f"{item['rooms']}-комнатная" if item["rooms"] else item["title"]
     return (
-        f"🏠 <b>{item['title']}</b>\n"
-        f"💰 {item['price']}\n"
-        f"📍 {item['address']}\n"
+        f"🏠 {rooms_str}\n"
+        f"💰 {price_str}\n"
         f"{item['url']}"
     )
 
@@ -181,14 +207,23 @@ def main():
         all_listings.extend(listings)
         time.sleep(2)  # небольшая пауза между страницами
 
-    new_items = [item for item in all_listings if item["id"] not in seen]
+    matching = [item for item in all_listings if matches_criteria(item)]
+    new_items = [item for item in matching if item["id"] not in seen]
 
-    print(f"Всего найдено объявлений: {len(all_listings)}, новых: {len(new_items)}")
+    print(
+        f"Всего просмотрено объявлений: {len(all_listings)}, "
+        f"подходящих под критерии: {len(matching)}, новых: {len(new_items)}"
+    )
 
     for item in new_items:
         send_telegram_message(format_message(item))
-        seen.add(item["id"])
         time.sleep(1)  # чтобы не спамить Telegram API
+
+    # Помечаем увиденными вообще все просмотренные объявления (не только
+    # подходящие) — иначе объявление, которое сначала не подходило, а потом
+    # его цену поправили под критерии, будет считаться "новым" повторно.
+    for item in all_listings:
+        seen.add(item["id"])
 
     save_seen_ids(seen)
 

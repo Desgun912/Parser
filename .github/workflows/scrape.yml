@@ -2,11 +2,13 @@ name: Krisha parser
 
 on:
   schedule:
+    # каждые 15 минут (UTC). Крон в GitHub Actions может запускаться
+    # с задержкой в несколько минут — для личных целей это не критично.
     - cron: "*/15 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch: {}   # позволяет запустить вручную из вкладки Actions
 
 permissions:
-  contents: write
+  contents: write   # нужно, чтобы сохранять seen_ids.json обратно в репозиторий
 
 jobs:
   scrape:
@@ -31,6 +33,16 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_IDS: ${{ secrets.TELEGRAM_CHAT_IDS }}
         run: python scraper.py
+
+      - name: Upload OLX debug files (if any)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: olx-debug
+          path: |
+            olx_debug.png
+            olx_debug.html
+          if-no-files-found: ignore
 
       - name: Save seen_ids.json back to repo
         run: |

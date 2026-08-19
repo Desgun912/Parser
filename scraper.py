@@ -1,12 +1,19 @@
 """
-Парсер объявлений аренды квартир с krisha.kz
-Ищет новые объявления по заданным критериям и шлёт уведомления в Telegram.
+Парсер объявлений аренды квартир с krisha.kz и olx.kz
+Ищет новые объявления по заданным критериям и шлёт уведомления в Telegram
+(можно нескольким получателям сразу).
 
-Важно: фильтры в URL Крыши (das[price][to] и т.д.) не всегда применяются
-надёжно при обычном GET-запросе (похоже, часть фильтрации у них работает
-через JS в браузере). Поэтому скрипт всегда дополнительно проверяет
-цену и количество комнат сам, уже после парсинга — это гарантирует, что
-в Telegram попадут только реально подходящие объявления.
+Важно про фильтры: URL-фильтры обоих сайтов не всегда применяются надёжно
+при обычном GET-запросе (часть фильтрации у них работает через JS в
+браузере). Поэтому скрипт всегда дополнительно проверяет цену и количество
+комнат сам, уже после парсинга — это гарантирует, что в Telegram попадут
+только реально подходящие объявления, независимо от того, сработал ли
+фильтр на стороне сайта.
+
+Про OLX отдельно: у сайта заметно более агрессивная антибот-защита, чем
+у Крыши. Есть риск, что запросы с серверов GitHub Actions будут иногда
+блокироваться — тогда OLX просто не даст новых объявлений в этом прогоне,
+без падения скрипта целиком (ошибка залогируется и парсер пойдёт дальше).
 """
 
 import os
@@ -22,9 +29,10 @@ CITY = "petropavlovsk"
 PRICE_TO = 145000          # максимальная цена, тг/мес
 ROOMS = [1, 2]              # список нужных вариантов комнат
 
-BASE_URL = f"https://krisha.kz/arenda/kvartiry/{CITY}/"
+KRISHA_BASE_URL = f"https://krisha.kz/arenda/kvartiry/{CITY}/"
+OLX_BASE_URL = f"https://www.olx.kz/nedvizhimost/arenda-kvartiry/{CITY}/"
 
-# Максимум страниц результатов, которые проверяем за один прогон
+# Максимум страниц результатов, которые проверяем за один прогон (на каждый сайт)
 MAX_PAGES = 6
 
 # Файл, где хранятся ID уже увиденных объявлений
@@ -33,7 +41,11 @@ SEEN_FILE = "seen_ids.json"
 # ---------------------- TELEGRAM ----------------------
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+# Несколько получателей: в секрете TELEGRAM_CHAT_IDS перечисляем chat_id
+# через запятую, например: "111111111,222222222"
+_raw_chat_ids = os.environ.get("TELEGRAM_CHAT_IDS", "") or os.environ.get("TELEGRAM_CHAT_ID", "")
+CHAT_IDS = [c.strip() for c in _raw_chat_ids.split(",") if c.strip()]
 
 HEADERS = {
     "User-Agent": (
@@ -41,31 +53,8 @@ HEADERS = {
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "ru-RU,ru;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
 }
-
-
-def build_search_url(page: int) -> str:
-    # Сортировка "сначала дешёвые" — так новые дешёвые объявления
-    # с большей вероятностью попадут в первые проверяемые страницы.
-    params = ["sort_by=price-asc"]
-    if page > 1:
-        params.append(f"page={page}")
-    return BASE_URL + "?" + "&".join(params)
-
-
-def load_seen_ids() -> set:
-    if os.path.exists(SEEN_FILE):
-        with open(SEEN_FILE, "r", encoding="utf-8") as f:
-            try:
-                return set(json.load(f))
-            except json.JSONDecodeError:
-                return set()
-    return set()
-
-
-def save_seen_ids(ids: set) -> None:
-    with open(SEEN_FILE, "w", encoding="utf-8") as f:
-        json.dump(sorted(ids), f, ensure_ascii=False, indent=2)
 
 
 def fetch_page(url: str) -> str | None:
@@ -95,29 +84,19 @@ def parse_rooms(text: str) -> int | None:
     return None
 
 
-def parse_listings(html: str) -> list[dict]:
+def extract_by_price_anchor(soup: BeautifulSoup, href_pattern: str) -> list[dict]:
     """
-    Извлекает объявления из HTML страницы результатов.
-
-    Подход устойчив к смене конкретных CSS-классов: сначала находим все
-    ссылки на /a/show/ID, а затем для каждой ищем ближайший родительский
-    блок, в тексте которого есть цена (символ ₸) — это и есть карточка
-    объявления. Из текста этого блока вытаскиваем цену и число комнат.
+    Общая логика извлечения карточек объявлений: находим ссылки по паттерну
+    href_pattern, поднимаемся к ближайшему родителю с ценой (₸) и вытаскиваем
+    оттуда цену/комнаты. Работает и для Крыши, и для OLX — устойчиво к смене
+    конкретных CSS-классов на сайте.
     """
-    soup = BeautifulSoup(html, "html.parser")
     listings = []
-    seen_ids = set()
+    seen_in_page = set()
 
-    for a in soup.select('a[href*="/a/show/"]'):
+    for a in soup.select(f'a[href*="{href_pattern}"]'):
         href = a.get("href", "")
-        m = re.search(r"/a/show/(\d+)", href)
-        if not m:
-            continue
-        ad_id = m.group(1)
-        if ad_id in seen_ids:
-            continue
 
-        # Поднимаемся вверх по дереву, пока не найдём блок с ценой (₸)
         card = a
         card_text = ""
         for _ in range(6):
@@ -129,26 +108,135 @@ def parse_listings(html: str) -> list[dict]:
                 break
 
         if not card_text or "₸" not in card_text:
-            continue  # не нашли карточку с ценой — пропускаем
+            continue
 
-        seen_ids.add(ad_id)
-
+        title = a.get_text(strip=True) or "Квартира"
         price = parse_price(card_text)
         rooms = parse_rooms(card_text)
 
-        title = a.get_text(strip=True) or "Квартира"
-
-        full_url = href if href.startswith("http") else "https://krisha.kz" + href
+        key = href
+        if key in seen_in_page:
+            continue
+        seen_in_page.add(key)
 
         listings.append({
-            "id": ad_id,
+            "href": href,
             "title": title,
             "price": price,
             "rooms": rooms,
-            "url": full_url,
         })
 
     return listings
+
+
+# ---------------------- KRISHA.KZ ----------------------
+
+def build_krisha_url(page: int) -> str:
+    params = ["sort_by=price-asc"]
+    if page > 1:
+        params.append(f"page={page}")
+    return KRISHA_BASE_URL + "?" + "&".join(params)
+
+
+def parse_krisha_listings(html: str) -> list[dict]:
+    soup = BeautifulSoup(html, "html.parser")
+    raw = extract_by_price_anchor(soup, "/a/show/")
+
+    listings = []
+    for item in raw:
+        m = re.search(r"/a/show/(\d+)", item["href"])
+        if not m:
+            continue
+        ad_id = m.group(1)
+        full_url = item["href"] if item["href"].startswith("http") else "https://krisha.kz" + item["href"]
+        listings.append({
+            "source": "krisha",
+            "id": f"krisha:{ad_id}",
+            "title": item["title"],
+            "price": item["price"],
+            "rooms": item["rooms"],
+            "url": full_url,
+        })
+    return listings
+
+
+def fetch_krisha_listings() -> list[dict]:
+    all_listings = []
+    for page in range(1, MAX_PAGES + 1):
+        html = fetch_page(build_krisha_url(page))
+        if not html:
+            break
+        listings = parse_krisha_listings(html)
+        if not listings:
+            break
+        all_listings.extend(listings)
+        time.sleep(2)
+    return all_listings
+
+
+# ---------------------- OLX.KZ ----------------------
+
+def build_olx_url(page: int) -> str:
+    if page > 1:
+        return OLX_BASE_URL + f"?page={page}"
+    return OLX_BASE_URL
+
+
+def parse_olx_listings(html: str) -> list[dict]:
+    soup = BeautifulSoup(html, "html.parser")
+    raw = extract_by_price_anchor(soup, "/d/obyavlenie/")
+
+    listings = []
+    for item in raw:
+        # ID объявления OLX — последний сегмент пути перед .html, обычно
+        # заканчивается на -IDxxxxxxx. Берём весь href как уникальный ключ,
+        # чтобы не зависеть от точного формата ID.
+        href = item["href"]
+        m = re.search(r"ID([a-zA-Z0-9]+)\.html", href)
+        ad_id = m.group(1) if m else href
+
+        full_url = href if href.startswith("http") else "https://www.olx.kz" + href
+        listings.append({
+            "source": "olx",
+            "id": f"olx:{ad_id}",
+            "title": item["title"],
+            "price": item["price"],
+            "rooms": item["rooms"],
+            "url": full_url,
+        })
+    return listings
+
+
+def fetch_olx_listings() -> list[dict]:
+    all_listings = []
+    for page in range(1, MAX_PAGES + 1):
+        html = fetch_page(build_olx_url(page))
+        if not html:
+            print("OLX: не удалось загрузить страницу (возможно, заблокировано антиботом)")
+            break
+        listings = parse_olx_listings(html)
+        if not listings:
+            break
+        all_listings.extend(listings)
+        time.sleep(2)
+    return all_listings
+
+
+# ---------------------- ОБЩАЯ ЛОГИКА ----------------------
+
+def load_seen_ids() -> set:
+    if os.path.exists(SEEN_FILE):
+        with open(SEEN_FILE, "r", encoding="utf-8") as f:
+            try:
+                return set(json.load(f))
+            except json.JSONDecodeError:
+                return set()
+    return set()
+
+
+def save_seen_ids(ids: set) -> None:
+    with open(SEEN_FILE, "w", encoding="utf-8") as f:
+        json.dump(sorted(ids), f, ensure_ascii=False, indent=2)
 
 
 def matches_criteria(item: dict) -> bool:
@@ -164,29 +252,31 @@ def matches_criteria(item: dict) -> bool:
 
 
 def send_telegram_message(text: str) -> None:
-    if not BOT_TOKEN or not CHAT_ID:
-        print("Нет TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID — уведомление не отправлено:")
+    if not BOT_TOKEN or not CHAT_IDS:
+        print("Нет TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_IDS — уведомление не отправлено:")
         print(text)
         return
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": False,
-    }
-    try:
-        resp = requests.post(url, data=payload, timeout=20)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        print(f"Ошибка отправки в Telegram: {e}")
+    for chat_id in CHAT_IDS:
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": False,
+        }
+        try:
+            resp = requests.post(url, data=payload, timeout=20)
+            resp.raise_for_status()
+        except requests.RequestException as e:
+            print(f"Ошибка отправки в Telegram (chat_id={chat_id}): {e}")
 
 
 def format_message(item: dict) -> str:
     price_str = f"{item['price']:,} ₸".replace(",", " ") if item["price"] else "?"
     rooms_str = f"{item['rooms']}-комнатная" if item["rooms"] else item["title"]
+    source_label = "Крыша" if item["source"] == "krisha" else "OLX"
     return (
-        f"🏠 {rooms_str}\n"
+        f"🏠 {rooms_str} [{source_label}]\n"
         f"💰 {price_str}\n"
         f"{item['url']}"
     )
@@ -194,25 +284,19 @@ def format_message(item: dict) -> str:
 
 def main():
     seen = load_seen_ids()
-    all_listings = []
 
-    for page in range(1, MAX_PAGES + 1):
-        url = build_search_url(page)
-        html = fetch_page(url)
-        if not html:
-            break
-        listings = parse_listings(html)
-        if not listings:
-            break
-        all_listings.extend(listings)
-        time.sleep(2)  # небольшая пауза между страницами
+    krisha_listings = fetch_krisha_listings()
+    olx_listings = fetch_olx_listings()
+
+    all_listings = krisha_listings + olx_listings
 
     matching = [item for item in all_listings if matches_criteria(item)]
     new_items = [item for item in matching if item["id"] not in seen]
 
     print(
-        f"Всего просмотрено объявлений: {len(all_listings)}, "
-        f"подходящих под критерии: {len(matching)}, новых: {len(new_items)}"
+        f"Крыша: просмотрено {len(krisha_listings)}. "
+        f"OLX: просмотрено {len(olx_listings)}. "
+        f"Подходящих под критерии: {len(matching)}, новых: {len(new_items)}"
     )
 
     for item in new_items:

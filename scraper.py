@@ -239,6 +239,14 @@ def fetch_olx_listings() -> list[dict]:
                 if not listings:
                     if page_num == 1:
                         print("OLX: на первой странице ничего не найдено — возможно, всё ещё заблокировано")
+                        print(f"OLX: заголовок страницы: {page_obj.title()!r}")
+                        try:
+                            page_obj.screenshot(path="olx_debug.png", full_page=True)
+                            with open("olx_debug.html", "w", encoding="utf-8") as f:
+                                f.write(html)
+                            print("OLX: сохранён отладочный скриншот olx_debug.png и olx_debug.html")
+                        except Exception as e:
+                            print(f"OLX: не удалось сохранить отладочные файлы: {e}")
                     break
                 all_listings.extend(listings)
                 time.sleep(2)

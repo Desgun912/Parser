@@ -3,17 +3,17 @@
 Ищет новые объявления по заданным критериям и шлёт уведомления в Telegram
 (можно нескольким получателям сразу).
 
-Важно про фильтры: URL-фильтры обоих сайтов не всегда применяются надёжно
-при обычном GET-запросе (часть фильтрации у них работает через JS в
-браузере). Поэтому скрипт всегда дополнительно проверяет цену и количество
-комнат сам, уже после парсинга — это гарантирует, что в Telegram попадут
-только реально подходящие объявления, независимо от того, сработал ли
-фильтр на стороне сайта.
+Крыша парсится обычным HTTP-запросом (requests) — этого достаточно.
 
-Про OLX отдельно: у сайта заметно более агрессивная антибот-защита, чем
-у Крыши. Есть риск, что запросы с серверов GitHub Actions будут иногда
-блокироваться — тогда OLX просто не даст новых объявлений в этом прогоне,
-без падения скрипта целиком (ошибка залогируется и парсер пойдёт дальше).
+OLX активно блокирует простые HTTP-запросы (403 Forbidden), поэтому для
+него используется Playwright — по-настоящему запускает Chrome в фоне,
+что выглядит для антибот-защиты как обычный пользователь. Это не даёт
+100% гарантии обхода блокировки, но заметно повышает шансы.
+
+Про фильтры: URL-фильтры обоих сайтов не всегда применяются надёжно.
+Поэтому скрипт всегда дополнительно проверяет цену и количество комнат
+сам, уже после парсинга — так в Telegram попадут только реально
+подходящие объявления, независимо от фильтров самого сайта.
 """
 
 import os
@@ -55,16 +55,6 @@ HEADERS = {
     "Accept-Language": "ru-RU,ru;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
 }
-
-
-def fetch_page(url: str) -> str | None:
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
-        return resp.text
-    except requests.RequestException as e:
-        print(f"Ошибка загрузки {url}: {e}")
-        return None
 
 
 def parse_price(text: str) -> int | None:
@@ -129,7 +119,17 @@ def extract_by_price_anchor(soup: BeautifulSoup, href_pattern: str) -> list[dict
     return listings
 
 
-# ---------------------- KRISHA.KZ ----------------------
+# ---------------------- KRISHA.KZ (requests) ----------------------
+
+def fetch_page_requests(url: str) -> str | None:
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+        return resp.text
+    except requests.RequestException as e:
+        print(f"Ошибка загрузки {url}: {e}")
+        return None
+
 
 def build_krisha_url(page: int) -> str:
     params = ["sort_by=price-asc"]
@@ -163,7 +163,7 @@ def parse_krisha_listings(html: str) -> list[dict]:
 def fetch_krisha_listings() -> list[dict]:
     all_listings = []
     for page in range(1, MAX_PAGES + 1):
-        html = fetch_page(build_krisha_url(page))
+        html = fetch_page_requests(build_krisha_url(page))
         if not html:
             break
         listings = parse_krisha_listings(html)
@@ -174,7 +174,7 @@ def fetch_krisha_listings() -> list[dict]:
     return all_listings
 
 
-# ---------------------- OLX.KZ ----------------------
+# ---------------------- OLX.KZ (Playwright) ----------------------
 
 def build_olx_url(page: int) -> str:
     if page > 1:
@@ -188,9 +188,6 @@ def parse_olx_listings(html: str) -> list[dict]:
 
     listings = []
     for item in raw:
-        # ID объявления OLX — последний сегмент пути перед .html, обычно
-        # заканчивается на -IDxxxxxxx. Берём весь href как уникальный ключ,
-        # чтобы не зависеть от точного формата ID.
         href = item["href"]
         m = re.search(r"ID([a-zA-Z0-9]+)\.html", href)
         ad_id = m.group(1) if m else href
@@ -208,17 +205,48 @@ def parse_olx_listings(html: str) -> list[dict]:
 
 
 def fetch_olx_listings() -> list[dict]:
+    """Парсит OLX через настоящий браузер (Playwright), чтобы обойти
+    антибот-защиту, которая блокирует обычные HTTP-запросы."""
     all_listings = []
-    for page in range(1, MAX_PAGES + 1):
-        html = fetch_page(build_olx_url(page))
-        if not html:
-            print("OLX: не удалось загрузить страницу (возможно, заблокировано антиботом)")
-            break
-        listings = parse_olx_listings(html)
-        if not listings:
-            break
-        all_listings.extend(listings)
-        time.sleep(2)
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("OLX: библиотека playwright не установлена — пропускаем OLX")
+        return all_listings
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=HEADERS["User-Agent"],
+                locale="ru-RU",
+            )
+            page_obj = context.new_page()
+
+            for page_num in range(1, MAX_PAGES + 1):
+                url = build_olx_url(page_num)
+                try:
+                    page_obj.goto(url, timeout=30000, wait_until="domcontentloaded")
+                    # даём странице время дорисоваться / пройти проверку антибота
+                    page_obj.wait_for_timeout(4000)
+                    html = page_obj.content()
+                except Exception as e:
+                    print(f"OLX: ошибка загрузки страницы {page_num}: {e}")
+                    break
+
+                listings = parse_olx_listings(html)
+                if not listings:
+                    if page_num == 1:
+                        print("OLX: на первой странице ничего не найдено — возможно, всё ещё заблокировано")
+                    break
+                all_listings.extend(listings)
+                time.sleep(2)
+
+            browser.close()
+    except Exception as e:
+        print(f"OLX: не удалось запустить браузер: {e}")
+
     return all_listings
 
 

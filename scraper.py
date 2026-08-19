@@ -58,63 +58,86 @@ HEADERS = {
 
 
 def parse_price(text: str) -> int | None:
-    """Ищет в тексте цену вида '150 000 ₸' и возвращает её как число."""
-    m = re.search(r"([\d\s]{4,})\s*₸", text)
+    """Ищет в тексте цену вида '150 000 ₸' или '150 000 тг.' и возвращает
+    её как число. Крыша использует символ ₸, OLX пишет сокращение 'тг.'."""
+    m = re.search(r"([\d\s]{4,})\s*(₸|тг\.)", text)
     if not m:
         return None
     digits = re.sub(r"\D", "", m.group(1))
     return int(digits) if digits else None
 
 
+PRICE_MARKER_RE = re.compile(r"₸|тг\.")
+
+
+_ROOM_WORDS = {
+    "одно": 1, "одна": 1,
+    "двух": 2, "двушк": 2,
+    "трех": 3, "трёх": 3,
+    "четырех": 4, "четырёх": 4,
+}
+
+
 def parse_rooms(text: str) -> int | None:
-    """Ищет в тексте количество комнат вида '2-комнатная'."""
-    m = re.search(r"(\d+)-комнатн", text)
+    """Ищет в тексте количество комнат в разных форматах написания:
+    '2-комнатная', '3 ком', '1-ком', '2х комнатную', 'двухкомнатная' и т.п."""
+    m = re.search(r"(\d+)\s*[-хХ]{0,2}\.?\s*комн?", text, flags=re.IGNORECASE)
     if m:
         return int(m.group(1))
+
+    m = re.search(r"(одно|одна|двух|двушк|трех|трёх|четырех|четырёх)\s*комнат", text, flags=re.IGNORECASE)
+    if m:
+        return _ROOM_WORDS.get(m.group(1).lower())
+
     return None
 
 
 def extract_by_price_anchor(soup: BeautifulSoup, href_pattern: str) -> list[dict]:
     """
     Общая логика извлечения карточек объявлений: находим ссылки по паттерну
-    href_pattern, поднимаемся к ближайшему родителю с ценой (₸) и вытаскиваем
+    href_pattern, поднимаемся к ближайшему родителю с ценой и вытаскиваем
     оттуда цену/комнаты. Работает и для Крыши, и для OLX — устойчиво к смене
     конкретных CSS-классов на сайте.
+
+    Одна и та же ссылка на объявление может встречаться на странице
+    несколько раз (например, обёрткой вокруг картинки без текста и отдельно
+    вокруг заголовка) — поэтому сначала собираем все варианты по href и
+    берём тот, где есть непустой текст заголовка.
     """
-    listings = []
-    seen_in_page = set()
+    by_href: dict[str, dict] = {}
 
     for a in soup.select(f'a[href*="{href_pattern}"]'):
         href = a.get("href", "")
+        title = a.get_text(strip=True)
 
-        card = a
-        card_text = ""
-        for _ in range(6):
-            card = card.find_parent("div")
-            if card is None:
-                break
-            card_text = card.get_text(" ", strip=True)
-            if "₸" in card_text:
-                break
+        if href not in by_href:
+            card = a
+            card_text = ""
+            for _ in range(6):
+                card = card.find_parent("div")
+                if card is None:
+                    break
+                card_text = card.get_text(" ", strip=True)
+                if PRICE_MARKER_RE.search(card_text):
+                    break
 
-        if not card_text or "₸" not in card_text:
-            continue
+            if not card_text or not PRICE_MARKER_RE.search(card_text):
+                continue
 
-        title = a.get_text(strip=True) or "Квартира"
-        price = parse_price(card_text)
-        rooms = parse_rooms(card_text)
+            by_href[href] = {
+                "href": href,
+                "title": title,
+                "price": parse_price(card_text),
+                "rooms": parse_rooms(card_text),
+            }
+        elif title and not by_href[href]["title"]:
+            # нашли вариант ссылки с непустым текстом — обновляем заголовок
+            by_href[href]["title"] = title
 
-        key = href
-        if key in seen_in_page:
-            continue
-        seen_in_page.add(key)
-
-        listings.append({
-            "href": href,
-            "title": title,
-            "price": price,
-            "rooms": rooms,
-        })
+    listings = list(by_href.values())
+    for item in listings:
+        if not item["title"]:
+            item["title"] = "Квартира"
 
     return listings
 

@@ -281,7 +281,64 @@ def fetch_olx_listings() -> list[dict]:
     return all_listings
 
 
-# ---------------------- ОБЩАЯ ЛОГИКА ----------------------
+SUSPICIOUS_SELLER_RE = re.compile(
+    r"(ватсап|whatsapp|wattsap|vatsap)\s*[\d\s\-]{5,}",
+    re.IGNORECASE,
+)
+
+MAX_SELLER_CHECKS = 15  # ограничение на кол-во доп. проверок за один прогон
+
+
+def flag_suspicious_olx_items(new_olx_items: list[dict]) -> None:
+    """
+    Для новых объявлений с OLX заходит на страницу самого объявления и
+    проверяет имя продавца на признак мошенничества — когда вместо имени
+    указано что-то вроде 'Ватсап775 159 5147'. Настоящие частные
+    объявления обычно имеют нормальное имя.
+
+    Не блокирует объявление, а помечает его полем 'suspicious': True —
+    решение всё равно принимает пользователь, автоматический фильтр не
+    может быть точным на 100%.
+
+    Ограничено MAX_SELLER_CHECKS, чтобы не раздувать время прогона, если
+    новых объявлений окажется много — остальные просто не проверяются
+    и остаются непомеченными.
+    """
+    if not new_olx_items:
+        return
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return
+
+    to_check = new_olx_items[:MAX_SELLER_CHECKS]
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=HEADERS["User-Agent"],
+                locale="ru-RU",
+            )
+            page_obj = context.new_page()
+
+            for item in to_check:
+                try:
+                    page_obj.goto(item["url"], timeout=20000, wait_until="domcontentloaded")
+                    page_obj.wait_for_timeout(2000)
+                    body_text = page_obj.inner_text("body")
+                except Exception as e:
+                    print(f"OLX: не удалось проверить продавца для {item['url']}: {e}")
+                    continue
+
+                if SUSPICIOUS_SELLER_RE.search(body_text):
+                    item["suspicious"] = True
+
+            browser.close()
+    except Exception as e:
+        print(f"OLX: не удалось запустить браузер для проверки продавцов: {e}")
+
 
 def load_seen_ids() -> set:
     if os.path.exists(SEEN_FILE):
@@ -334,10 +391,12 @@ def format_message(item: dict) -> str:
     price_str = f"{item['price']:,} ₸".replace(",", " ") if item["price"] else "?"
     rooms_str = f"{item['rooms']}-комнатная" if item["rooms"] else item["title"]
     source_label = "Крыша" if item["source"] == "krisha" else "OLX"
+    warning = "\n⚠️ Похоже на подозрительное объявление (проверьте продавца)" if item.get("suspicious") else ""
     return (
         f"🏠 {rooms_str} [{source_label}]\n"
         f"💰 {price_str}\n"
         f"{item['url']}"
+        f"{warning}"
     )
 
 
@@ -351,6 +410,9 @@ def main():
 
     matching = [item for item in all_listings if matches_criteria(item)]
     new_items = [item for item in matching if item["id"] not in seen]
+
+    new_olx_items = [item for item in new_items if item["source"] == "olx"]
+    flag_suspicious_olx_items(new_olx_items)
 
     print(
         f"Крыша: просмотрено {len(krisha_listings)}. "
